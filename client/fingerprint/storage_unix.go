@@ -5,11 +5,9 @@ package fingerprint
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
-	"strings"
+	"syscall"
+	"github.com/moby/sys/mountinfo"
 )
 
 // diskFree inspects the filesystem for path and returns the volume name and
@@ -20,46 +18,31 @@ func (f *StorageFingerprint) diskFree(path string) (volume string, total, free u
 		return "", 0, 0, fmt.Errorf("failed to determine absolute path for %s", path)
 	}
 
-	// Use -k to standardize the output values between darwin and linux
-	var dfArgs string
-	if runtime.GOOS == "linux" {
-		// df on linux needs the -P option to prevent linebreaks on long filesystem paths
-		dfArgs = "-kP"
-	} else {
-		dfArgs = "-k"
+	// Execute statfs on the given path
+	stat := syscall.Statfs_t{}
+	err = syscall.Statfs(absPath, &stat)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to perform statfs on %s\n%s", absPath, err.Error())
 	}
 
-	mountOutput, err := exec.Command("df", dfArgs, absPath).Output()
+	// Convert blocks into bytes
+	total = uint64(stat.Bsize) * stat.Blocks
+	free = uint64(stat.Bsize) * stat.Bavail
+
+	// Fetch the mount point for the path
+	filter := mountinfo.ParentsFilter(absPath)
+	info, err := mountinfo.GetMounts(filter)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to determine mount point for %s", absPath)
 	}
-	// Output looks something like:
-	//	Filesystem 1024-blocks      Used Available Capacity   iused    ifree %iused  Mounted on
-	//	/dev/disk1   487385240 423722532  63406708    87% 105994631 15851677   87%   /
-	//	[0] volume [1] capacity [2] SKIP  [3] free
-	lines := strings.Split(string(mountOutput), "\n")
-	if len(lines) < 2 {
-		return "", 0, 0, fmt.Errorf("failed to parse `df` output; expected at least 2 lines")
-	}
-	fields := strings.Fields(lines[1])
-	if len(fields) < 4 {
-		return "", 0, 0, fmt.Errorf("failed to parse `df` output; expected at least 4 columns")
-	}
-	volume = fields[0]
 
-	total, err = strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("failed to parse storage.bytestotal size in kilobytes")
+	// Get the deepest mount point for the path
+	volume = ""
+	for _, entry := range info {
+		if info == nil || len(volume) < len(entry.Root) {
+			volume = entry.Root
+		}
 	}
-	// convert to bytes
-	total *= 1024
-
-	free, err = strconv.ParseUint(fields[3], 10, 64)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("failed to parse storage.bytesfree size in kilobytes")
-	}
-	// convert to bytes
-	free *= 1024
 
 	return volume, total, free, nil
 }
